@@ -1,0 +1,6 @@
+python-telegram-bot==20.7
+firebase-admin==6.6.0
+google-cloud-firestore==2.16.0
+google-auth==2.35.0
+requests==2.32.3
+matplotlib==3.9.2
