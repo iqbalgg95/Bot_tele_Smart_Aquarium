@@ -1,5 +1,5 @@
 # tele_bot_interaktif_final_fix_menu.py
-import os, io, time, asyncio, threading, logging, json
+import os, io, time, asyncio, threading, logging, json, base64
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -20,7 +20,7 @@ from firebase_admin import credentials, db
 from google.cloud import firestore
 from google.cloud.firestore_v1 import FieldFilter
 from google.auth.exceptions import TransportError
-from google.oauth2 import service_account  # <-- for Firestore client creds
+from google.oauth2 import service_account  # Firestore creds
 
 # =========================
 # Logging
@@ -63,27 +63,35 @@ def _extract_json_blob(s: str) -> str:
 def _load_credentials():
     """
     Prioritas:
-      1) FIREBASE_CREDENTIALS_JSON (string JSON)
+      1) FIREBASE_CREDENTIALS_JSON (string JSON / base64)
       2) GOOGLE_APPLICATION_CREDENTIALS (path file)
     Return: (cred_dict, sa_credentials)
       - cred_dict untuk firebase_admin.credentials.Certificate
       - sa_credentials untuk Firestore (google.oauth2.service_account.Credentials)
     """
-    # 1) Dari ENV JSON string
+    # 1) Dari ENV JSON string / base64
     if GA_JSON_RAW:
         blob = _extract_json_blob(GA_JSON_RAW)
+        cred_dict = None
+
+        # Coba parse langsung sebagai JSON
         try:
             cred_dict = json.loads(blob)
-        except json.JSONDecodeError as e:
-            raise RuntimeError(f"FIREBASE_CREDENTIALS_JSON tidak valid: {e}")
+        except json.JSONDecodeError:
+            # Coba decode base64 -> JSON
+            try:
+                decoded = base64.b64decode(blob).decode("utf-8")
+                cred_dict = json.loads(decoded)
+            except Exception as e:
+                raise RuntimeError(f"FIREBASE_CREDENTIALS_JSON tidak valid: {e}")
 
-        # Normalisasi private_key bila ada \r\n
+        # Normalisasi private_key
         pk = cred_dict.get("private_key")
         if isinstance(pk, str):
-            # Jika ada literal '\\n', biarkan; jika ada CRLF, normalkan
-            cred_dict["private_key"] = pk.replace("\r\n", "\n")
+            # tangani literal '\\n' dan CRLF
+            cred_dict["private_key"] = pk.replace("\\n", "\n").replace("\r\n", "\n")
 
-        # Buat service account credentials untuk Firestore
+        # Service account credentials untuk Firestore
         sa_credentials = service_account.Credentials.from_service_account_info(cred_dict)
         return cred_dict, sa_credentials
 
@@ -98,7 +106,7 @@ def _load_credentials():
 
         pk = cred_dict.get("private_key")
         if isinstance(pk, str):
-            cred_dict["private_key"] = pk.replace("\r\n", "\n")
+            cred_dict["private_key"] = pk.replace("\\n", "\n").replace("\r\n", "\n")
 
         # Firestore credential dari file
         sa_credentials = service_account.Credentials.from_service_account_file(GA_PATH)
@@ -266,9 +274,11 @@ def fetch_sensor_history_firestore(start_date, end_date):
     results.sort(key=lambda x: x["timestamp"])
     return results
 
-def _parse_ts(ts_str):
+def _parse_ts(ts_raw):
+    if isinstance(ts_raw, datetime):
+        return ts_raw
     try:
-        return datetime.strptime(ts_str, "%Y-%m-%d_%H-%M")
+        return datetime.strptime(ts_raw, "%Y-%m-%d_%H-%M")
     except Exception:
         return None
 
@@ -472,7 +482,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
            "🔎 /monitoring → Cek Suhu & NTU\n"
            "📊 /grafik → Buat grafik sensor\n"
            "📜 /riwayat → Riwayat pakan")
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 # Pakan manual
 async def pakan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -523,18 +533,24 @@ def start_temperature_listener(bot, loop):
     ref = db.reference('/aquarium/sensors')
 
     def listener(event):
-        data = event.data
-        if not isinstance(data, dict):
-            return
-        temp = data.get("temperature")
-        ntu  = data.get("ntu")
-        timestamp = data.get("time")
-        asyncio.run_coroutine_threadsafe(
-            check_temperature_ntu_alert(bot, temp, ntu, timestamp),
-            loop
-        )
+        try:
+            data = event.data
+            if not isinstance(data, dict):
+                return
+            temp = data.get("temperature")
+            ntu  = data.get("ntu")
+            timestamp = data.get("time")
+            asyncio.run_coroutine_threadsafe(
+                check_temperature_ntu_alert(bot, temp, ntu, timestamp),
+                loop
+            )
+        except Exception as e:
+            logger.error(f"Listener error: {e}")
 
-    ref.listen(listener)
+    try:
+        ref.listen(listener)
+    except Exception as e:
+        logger.error(f"Gagal start listener Firebase: {e}")
 
 async def check_temperature_ntu_alert(bot, temp, ntu, timestamp=None):
     global last_notified_low_temp_date, last_notified_high_temp_date, last_notified_high_ntu_date
@@ -848,7 +864,7 @@ async def riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, d in enumerate(rows, start=1):
         ts_raw = d.get("timestamp", "")
         ts_obj = _parse_ts(ts_raw)
-        waktu = ts_obj.strftime("%d %B %Y %H:%M") if ts_obj else ts_raw
+        waktu = ts_obj.strftime("%d %B %Y %H:%M") if ts_obj else str(ts_raw)
         mode = d.get("mode", "Unknown")
         msg += f"{i}. {waktu} → Mode: {mode}\n"
 
@@ -918,19 +934,18 @@ def main():
     )
     app.add_handler(setjam_handler)
 
-    # Conversation: grafik
+    # Conversation: grafik (lengkap dengan SETJAM_HARIAN di dalam states)
     grafik_handler = ConversationHandler(
         entry_points=[CommandHandler('grafik', grafik_start)],
         states={
             PERIODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, grafik_periode)],
             TANGGAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, grafik_tanggal)],
+            SETJAM_HARIAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, grafik_setjam_harian)],
             TIPE_GRAFIK: [MessageHandler(filters.TEXT & ~filters.COMMAND, grafik_tipe)]
         },
         fallbacks=[CommandHandler('batal', grafik_cancel)]
     )
     app.add_handler(grafik_handler)
-    # Tambah state SETJAM_HARIAN
-    grafik_handler.states[SETJAM_HARIAN] = [MessageHandler(filters.TEXT & ~filters.COMMAND, grafik_setjam_harian)]
 
     # Listener sensors (jalan di thread terpisah)
     threading.Thread(target=start_temperature_listener, args=(app.bot, loop), daemon=True).start()
