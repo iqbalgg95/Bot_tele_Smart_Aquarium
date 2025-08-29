@@ -66,26 +66,25 @@ def _load_credentials():
         raise RuntimeError("FIREBASE_CREDENTIALS_JSON tidak ditemukan")
 
     try:
+        # Parse JSON
         cred_dict = json.loads(blob)
 
-        # FIX: ubah \n menjadi newline beneran di private_key
+        # 🔑 Perbaikan untuk private_key
         if "private_key" in cred_dict:
-            cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
+            key = cred_dict["private_key"]
+
+            # Kalau masih ada '\n' literal, ubah jadi newline asli
+            if "\\n" in key:
+                cred_dict["private_key"] = key.replace("\\n", "\n")
+
+            # Kalau ada spasi/escape aneh di awal/akhir → strip
+            cred_dict["private_key"] = cred_dict["private_key"].strip()
 
         sa_credentials = service_account.Credentials.from_service_account_info(cred_dict)
         return cred_dict, sa_credentials
+
     except Exception as e:
         raise RuntimeError(f"FIREBASE_CREDENTIALS_JSON tidak valid: {e}")
-
-        # Normalisasi private_key
-        pk = cred_dict.get("private_key")
-        if isinstance(pk, str):
-            # tangani literal '\\n' dan CRLF
-            cred_dict["private_key"] = pk.replace("\\n", "\n").replace("\r\n", "\n")
-
-        # Service account credentials untuk Firestore
-        sa_credentials = service_account.Credentials.from_service_account_info(cred_dict)
-        return cred_dict, sa_credentials
 
     # 2) Fallback: dari file path
     if GA_PATH and os.path.exists(GA_PATH):
@@ -947,4 +946,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
