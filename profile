@@ -1,1 +1,1 @@
-worker: python tele_bot_interaktif_final_fix_menu.py
+worker: python tele.py
