@@ -1,51 +1,84 @@
 # tele_bot_interaktif_final_fix_menu.py
+import os, io, time, asyncio, threading, logging
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+import requests.exceptions
+import matplotlib
+matplotlib.use("Agg")  # backend headless untuk server
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
     ConversationHandler, MessageHandler, filters
 )
+
 import firebase_admin
 from firebase_admin import credentials, db
 from google.cloud import firestore
 from google.cloud.firestore_v1 import FieldFilter
-from collections import defaultdict
-from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import io
-import threading
-import asyncio
-import time
-import requests.exceptions
-import logging
 from google.auth.exceptions import TransportError
 
-# ====== Logging ======
+# =========================
+# Logging
+# =========================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("fish-bot")
 
-# ====== Konfigurasi Firebase Realtime DB ======
-cred = credentials.Certificate("smartaquarium-project-firebase-adminsdk-fbsvc-faf4311f3d.json")
-firebase_admin.initialize_app(cred, {
-    'databaseURL': 'https://smartaquarium-project-default-rtdb.asia-southeast1.firebasedatabase.app/'
-})
+# =========================
+# Konfigurasi via ENV VARS
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # wajib
+CHAT_ID = int(os.getenv("BOT_CHAT_ID", "0"))  # wajib → ganti di env
+RTDB_URL = os.getenv("RTDB_URL")  # wajib: ex https://xxxxx-default-rtdb.asia-southeast1.firebasedatabase.app/
+GA_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+GA_JSON = os.getenv("FIREBASE_CREDENTIALS_JSON", "").strip()
 
-# ====== Konfigurasi Firestore ======
-fs_client = firestore.Client.from_service_account_json(
-    "smartaquarium-project-firebase-adminsdk-fbsvc-faf4311f3d.json"
-)
+if not BOT_TOKEN:
+    raise RuntimeError("Env BOT_TOKEN belum diset.")
+if CHAT_ID == 0:
+    raise RuntimeError("Env BOT_CHAT_ID belum diset.")
+if not RTDB_URL:
+    raise RuntimeError("Env RTDB_URL belum diset.")
 
-# ====== Event Loop Fix ======
+# Jika kredensial diberikan sebagai JSON string, simpan ke file temp
+if not GA_PATH and GA_JSON:
+    GA_PATH = "/tmp/firebase_service_account.json"
+    with open(GA_PATH, "w", encoding="utf-8") as f:
+        f.write(GA_JSON)
+
+if not GA_PATH or not os.path.exists(GA_PATH):
+    raise RuntimeError("Credential Firebase tidak ditemukan. Set GOOGLE_APPLICATION_CREDENTIALS atau FIREBASE_CREDENTIALS_JSON.")
+
+# =========================
+# Inisialisasi Firebase
+# =========================
+if not firebase_admin._apps:
+    cred = credentials.Certificate(GA_PATH)
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': RTDB_URL
+    })
+
+# Firestore client
+fs_client = firestore.Client.from_service_account_json(GA_PATH)
+
+# =========================
+# Event loop (untuk thread listener)
+# =========================
 try:
     loop = asyncio.get_event_loop()
 except RuntimeError:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-# ====== Helper Firebase dengan retry ======
+# =========================
+# Helper Firebase dengan retry
+# =========================
 def safe_get(ref, retries=3, delay=5):
     for i in range(retries):
         try:
@@ -65,33 +98,29 @@ def safe_set(ref, value, retries=3, delay=5):
             time.sleep(delay)
     return False
 
-# ====== Variabel global ======
-feed_schedules = []       # list jadwal, format "HHMM"
+# =========================
+# Variabel global
+# =========================
+feed_schedules = []       # list "HHMM"
 last_feed_time = None
 FEED_COOLDOWN = timedelta(minutes=1)
 
-# Conversation states
-SETJAM, PERIODE, TANGGAL, TIPE_GRAFIK = range(4)
+LOW_TEMP_THRESHOLD = float(os.getenv("LOW_TEMP_THRESHOLD", "24.0"))
+HIGH_TEMP_THRESHOLD = float(os.getenv("HIGH_TEMP_THRESHOLD", "30.0"))
+NTU_THRESHOLD_HIGH  = int(os.getenv("NTU_THRESHOLD_HIGH", "1500"))
+NTU_THRESHOLD_MAX   = int(os.getenv("NTU_THRESHOLD_MAX", "3000"))
 
-last_notified_feed = None
-CHAT_ID = 1412037979  # ganti dengan chat_id kamu
-
-LOW_TEMP_THRESHOLD = 24.0
-HIGH_TEMP_THRESHOLD = 30.0
-last_notified_low_temp = None
-last_notified_high_temp = None
-
-last_notified_high_ntu = None
-NTU_THRESHOLD_HIGH = 1500  # mulai notifikasi jika >1500
-NTU_THRESHOLD_MAX  = 3000  # maksimal NTU untuk notifikasi
-
-# Variabel global untuk mencatat tanggal terakhir notifikasi
 last_notified_low_temp_date = None
 last_notified_high_temp_date = None
 last_notified_high_ntu_date = None
+last_notified_feed = None
 
+# Conversation states
+SETJAM, PERIODE, TANGGAL, TIPE_GRAFIK, SETJAM_HARIAN = range(5)
 
-# ====== Helper keyboard menu utama ======
+# =========================
+# UI Helpers
+# =========================
 def main_menu_keyboard():
     keyboard = [
         ["/pakan", "/jadwal"],
@@ -102,21 +131,17 @@ def main_menu_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def fill_missing_dates(data, start_dt, end_dt, field):
-    """
-    Mengisi tanggal yang tidak ada di data dengan 0
-    """
     daily_values = defaultdict(list)
     for d in data:
         try:
             ts = datetime.strptime(d['timestamp'], "%Y-%m-%d_%H-%M")
-        except:
+        except Exception:
             ts = d['timestamp']
         date_key = ts.strftime("%Y-%m-%d")
         if d.get(field) is not None:
             daily_values[date_key].append(d[field])
 
-    date_list = []
-    avg_values = []
+    date_list, avg_values = [], []
     current_date = start_dt
     while current_date <= end_dt:
         date_str = current_date.strftime("%Y-%m-%d")
@@ -130,7 +155,9 @@ def fill_missing_dates(data, start_dt, end_dt, field):
 
     return date_list, avg_values
 
-# ====== Fungsi bantu Realtime DB ======
+# =========================
+# Realtime DB Helpers
+# =========================
 def load_feed_schedules():
     global feed_schedules
     ref = db.reference('/aquarium/schedule')
@@ -150,7 +177,7 @@ def load_feed_schedules():
 def save_feed_schedules():
     global feed_schedules
     ref = db.reference('/aquarium/schedule')
-    safe_set(ref, {str(i): f"{v[:2]}:{v[2:]}" for i, v in enumerate(feed_schedules)})
+    safe_set(ref, {str(i): f"{v[:2]}:{v[2:]}" for i, v in enumerate(sorted(set(feed_schedules)))})
 
 def get_realtime_sensors():
     ref = db.reference('/aquarium/sensors')
@@ -164,7 +191,9 @@ def get_realtime_sensors():
         "ntu_status": data.get("ntu_status", "--")
     }
 
-# ====== Fungsi bantu Firestore (Sensor History) ======
+# =========================
+# Firestore Helpers
+# =========================
 def fetch_sensor_history_firestore(start_date, end_date):
     results = []
     sensor_history_ref = fs_client.collection("sensorHistory")
@@ -186,62 +215,26 @@ def fetch_sensor_history_firestore(start_date, end_date):
     results.sort(key=lambda x: x["timestamp"])
     return results
 
-# ====== Fungsi bantu Firestore (Riwayat Pakan) ======
 def _parse_ts(ts_str):
     try:
         return datetime.strptime(ts_str, "%Y-%m-%d_%H-%M")
     except Exception:
         return None
 
-def _is_feed_event(data: dict) -> bool:
-    """
-    Deteksi apakah dokumen adalah event pakan.
-    Kriteria (salah satu):
-      - ada 'mode' atau 'feed_mode'
-      - feed/isFeed/pakan == True
-      - event == 'feed'
-    """
-    if data is None:
-        return False
-    if any(k in data for k in ("mode", "feed_mode")):
-        return True
-    if any(bool(data.get(k, False)) for k in ("feed", "isFeed", "pakan")):
-        return True
-    if str(data.get("event", "")).lower() == "feed":
-        return True
-    return False
-
-def _feed_mode_from_doc(data: dict) -> str:
-    return str(
-        data.get("mode",
-        data.get("feed_mode",
-        data.get("event",
-        "Otomatis" if data.get("feed", False) else "Unknown"))))
-
 def fetch_feed_history_firestore(limit=10, date_filter: str=None, id_exact: str=None):
-    """
-    Ambil riwayat pakan dari koleksi 'historyFeed' (sesuai gambar).
-    - id_exact: 'YYYY-MM-DD_HH-MM' untuk dokumen spesifik.
-    - date_filter: 'YYYY-MM-DD' untuk semua event pada tanggal tsb.
-    - limit: jumlah event terbaru (jika tanpa filter).
-    Mengembalikan list dict: {timestamp, mode, raw}
-    """
     col = fs_client.collection("historyFeed")
 
-    # Dokumen spesifik
     if id_exact:
         snap = col.document(id_exact).get()
         if not snap.exists:
             return []
         data = snap.to_dict() or {}
-        # anggap semua dokumen di historyFeed adalah event pakan
         return [{
             "timestamp": data.get("timestamp", snap.id),
             "mode": data.get("mode", "Unknown"),
             "raw": data
         }]
 
-    # Filter per tanggal
     if date_filter:
         start = f"{date_filter}_00-00"
         end   = f"{date_filter}_23-59"
@@ -261,7 +254,6 @@ def fetch_feed_history_firestore(limit=10, date_filter: str=None, id_exact: str=
             })
         return results
 
-    # Default: ambil terbaru
     q = col.order_by("timestamp", direction=firestore.Query.DESCENDING).limit(max(1, limit))
     results = []
     for doc in q.stream():
@@ -273,13 +265,15 @@ def fetch_feed_history_firestore(limit=10, date_filter: str=None, id_exact: str=
         })
     return results
 
-# ====== Fungsi buat grafik ======
+# =========================
+# Grafik Helpers
+# =========================
 def create_plot(data, field, title, ylabel):
     timestamps = []
     for d in data:
         try:
             ts = datetime.strptime(d['timestamp'], "%Y-%m-%d_%H-%M")
-        except:
+        except Exception:
             ts = d['timestamp']
         timestamps.append(ts)
 
@@ -299,22 +293,13 @@ def create_plot(data, field, title, ylabel):
     plt.close()
     return buf
 
-import io
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from datetime import datetime
-from collections import defaultdict
-
 def create_plot_mingguan(data, field, title, ylabel, start_dt=None, end_dt=None):
-    """
-    Buat grafik mingguan/bulanan; tampilkan semua tanggal meski data kosong
-    """
     if start_dt is None or end_dt is None:
         timestamps = []
         for d in data:
             try:
                 ts = datetime.strptime(d['timestamp'], "%Y-%m-%d_%H-%M")
-            except:
+            except Exception:
                 ts = d['timestamp']
             timestamps.append(ts)
         if timestamps:
@@ -346,13 +331,12 @@ def create_plot_mingguan(data, field, title, ylabel, start_dt=None, end_dt=None)
     plt.close()
     return buf
 
-# ====== Fungsi buat grafik gabungan ======
 def create_dual_plot(data, start_date, end_date):
     timestamps = []
     for d in data:
         try:
             ts = datetime.strptime(d['timestamp'], "%Y-%m-%d_%H-%M")
-        except:
+        except Exception:
             ts = d['timestamp']
         timestamps.append(ts)
 
@@ -360,7 +344,6 @@ def create_dual_plot(data, start_date, end_date):
     ntu_values = [d['ntu'] if d['ntu'] is not None else 0 for d in data]
 
     fig, ax1 = plt.subplots(figsize=(10,4))
-
     ax1.set_xlabel("Waktu")
     ax1.set_ylabel("Suhu (°C)", color="tab:red")
     ax1.plot(timestamps, suhu_values, color="tab:red", marker='o', label="Suhu")
@@ -426,8 +409,10 @@ def create_dual_plot_mingguan(data, start_date_str, end_date_str):
     plt.close()
     return buf
 
-# ====== Command Handlers ======
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================
+# Command Handlers
+# =========================
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = ("🐟 *Bot Pakan Ikan Otomatis*\n\n"
            "🔵 /pakan → Pakan sekarang\n"
            "📅 /jadwal → Lihat jadwal\n"
@@ -438,7 +423,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
            "📜 /riwayat → Riwayat pakan")
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
 
-# ====== Pakan ======
+# Pakan manual
 async def pakan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_feed_time
     now = datetime.now()
@@ -460,44 +445,35 @@ async def pakan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_keyboard()
     )
 
-# ====== Notifikasi pakan otomatis ======
-sent_today = set()
-
+# Notifikasi pakan otomatis
 async def check_auto_feed(context: ContextTypes.DEFAULT_TYPE):
     global last_notified_feed
-
     now = datetime.now()
     current_hm = now.strftime("%H%M")
-
     if not feed_schedules:
         return
 
     for sched in feed_schedules:
         if current_hm == sched and sched != last_notified_feed:
             last_notified_feed = sched
-
             timestamp_str = now.strftime("%d %B %Y %H:%M")
-
-            # langsung pakai mode Otomatis
             await context.bot.send_message(
                 chat_id=CHAT_ID,
                 text=f"🐟 *Pakan Otomatis*\n\nMode: Otomatis\nWaktu: {timestamp_str}",
                 parse_mode="Markdown"
             )
-
-            # update ke Realtime DB
             safe_set(
                 db.reference('/aquarium/control/last_feed'),
                 {"time": now.strftime("%Y-%m-%d_%H-%M"), "mode": "Otomatis"}
             )
 
-# ====== Listener suhu (Realtime DB) ======
+# Listener suhu & NTU gabungan dari /aquarium/sensors
 def start_temperature_listener(bot, loop):
-    ref = db.reference('/aquarium/sensors')  # pastikan ambil suhu & NTU bersamaan
+    ref = db.reference('/aquarium/sensors')
 
     def listener(event):
         data = event.data
-        if not data:
+        if not isinstance(data, dict):
             return
         temp = data.get("temperature")
         ntu  = data.get("ntu")
@@ -515,14 +491,15 @@ async def check_temperature_ntu_alert(bot, temp, ntu, timestamp=None):
     if timestamp:
         try:
             dt = datetime.strptime(timestamp, "%Y-%m-%d_%H-%M")
-        except:
+        except Exception:
             dt = datetime.now()
     else:
         dt = datetime.now()
-    timestamp_str = dt.strftime("%d %B %Y %H:%M")
-    today_str = dt.strftime("%Y-%m-%d")  # format tanggal untuk 1 hari
 
-    # ==== Cek suhu rendah ====
+    timestamp_str = dt.strftime("%d %B %Y %H:%M")
+    today_str = dt.strftime("%Y-%m-%d")
+
+    # Suhu rendah
     if temp is not None and temp < LOW_TEMP_THRESHOLD:
         if last_notified_low_temp_date != today_str:
             last_notified_low_temp_date = today_str
@@ -532,7 +509,7 @@ async def check_temperature_ntu_alert(bot, temp, ntu, timestamp=None):
                 parse_mode="Markdown"
             )
 
-    # ==== Cek suhu tinggi ====
+    # Suhu tinggi
     if temp is not None and temp > HIGH_TEMP_THRESHOLD:
         if last_notified_high_temp_date != today_str:
             last_notified_high_temp_date = today_str
@@ -542,7 +519,7 @@ async def check_temperature_ntu_alert(bot, temp, ntu, timestamp=None):
                 parse_mode="Markdown"
             )
 
-    # ==== Cek NTU tinggi ====
+    # NTU tinggi (sekali per hari)
     if ntu is not None and NTU_THRESHOLD_HIGH < ntu <= NTU_THRESHOLD_MAX:
         if last_notified_high_ntu_date != today_str:
             last_notified_high_ntu_date = today_str
@@ -552,17 +529,17 @@ async def check_temperature_ntu_alert(bot, temp, ntu, timestamp=None):
                 parse_mode="Markdown"
             )
 
-# ====== Jadwal ======
+# Jadwal
 async def jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not feed_schedules:
         await update.message.reply_text("📅 Jadwal belum tersedia.", reply_markup=main_menu_keyboard())
         return
     msg = "📅 *Jadwal Pemberian Pakan*\n"
-    for i, sch in enumerate(feed_schedules, start=1):
+    for i, sch in enumerate(sorted(set(feed_schedules)), start=1):
         msg += f"{i}. {sch[:2]}:{sch[2:]}\n"
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
-# ====== Setjam interaktif ======
+# Setjam interaktif
 async def setjam_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⌚ Masukkan jadwal baru (contoh: 07:00,12:30,18:45)")
     return SETJAM
@@ -592,7 +569,7 @@ async def setjam_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Perubahan jadwal dibatalkan.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
 
-# ====== Hapus Jam ======
+# Hapus jam
 async def hapusjam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     try:
@@ -603,10 +580,10 @@ async def hapusjam(update: Update, context: ContextTypes.DEFAULT_TYPE):
         feed_schedules.pop(index-1)
         save_feed_schedules()
         await update.message.reply_text(f"✅ Jadwal ke-{index} berhasil dihapus.", reply_markup=main_menu_keyboard())
-    except:
+    except Exception:
         await update.message.reply_text("❌ Format salah. Contoh: /hapusjam 1", reply_markup=main_menu_keyboard())
 
-# ====== Monitoring ======
+# Monitoring
 async def monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = get_realtime_sensors()
     if not data:
@@ -617,7 +594,7 @@ async def monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
            f"💧 NTU : {data['ntu']} ({data['ntu_status']})\n")
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
-# ====== Grafik Interaktif ======
+# Grafik interaktif
 async def grafik_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         ["Harian (Suhu+NTU)"],
@@ -638,17 +615,14 @@ async def grafik_periode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['periode'] = "harian"
         await update.message.reply_text("Masukkan tanggal (YYYY-MM-DD):", reply_markup=ReplyKeyboardRemove())
         return TANGGAL
-
     elif text == "mingguan":
         context.user_data['periode'] = "mingguan"
         await update.message.reply_text("Masukkan tanggal akhir (YYYY-MM-DD):", reply_markup=ReplyKeyboardRemove())
         return TANGGAL
-
     elif text == "bulanan":
         context.user_data['periode'] = "bulanan"
         await update.message.reply_text("Masukkan tanggal awal bulan (YYYY-MM-DD):", reply_markup=ReplyKeyboardRemove())
         return TANGGAL
-
     else:
         await update.message.reply_text("❌ Pilih Harian / Mingguan / Bulanan.", reply_markup=main_menu_keyboard())
         return PERIODE
@@ -720,10 +694,9 @@ async def grafik_setjam_harian(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data['jam_awal'] = jam_awal
         context.user_data['jam_akhir'] = jam_akhir
 
-        # lanjut pilih tipe grafik
         await update.message.reply_text(
-            "Pilih Suhu, NTU, Semua grafik:", 
-            reply_markup=ReplyKeyboardMarkup([["Suhu","NTU","Semua"]], one_time_keyboard=True)
+            "Pilih Suhu, NTU, Semua grafik:",
+            reply_markup=ReplyKeyboardMarkup([["Suhu","NTU","Semua"]], one_time_keyboard=True, resize_keyboard=True)
         )
         return TIPE_GRAFIK
 
@@ -733,7 +706,6 @@ async def grafik_setjam_harian(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=ReplyKeyboardRemove()
         )
         return SETJAM_HARIAN
-
 
 async def grafik_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Batal melihat grafik.", reply_markup=main_menu_keyboard())
@@ -750,7 +722,6 @@ async def grafik_tipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         end_date_full   = context.user_data['end_date'] + f"_{jam_akhir.replace(':','-')}"
 
         data = fetch_sensor_history_firestore(start_date_full, end_date_full)
-
         if not data:
             await update.message.reply_text("❌ Data sensor tidak tersedia.", reply_markup=main_menu_keyboard())
             return ConversationHandler.END
@@ -761,28 +732,24 @@ async def grafik_tipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if tipe == "suhu":
             buf = create_plot(data, 'temperature', f"Suhu ({start_date} s/d {end_date})", "°C")
             await update.message.reply_photo(photo=buf, caption="📊 Grafik Suhu", reply_markup=main_menu_keyboard())
-
         elif tipe == "ntu":
             buf = create_plot(data, 'ntu', f"Kekeruhan NTU ({start_date} s/d {end_date})", "NTU")
             await update.message.reply_photo(photo=buf, caption="📊 Grafik NTU", reply_markup=main_menu_keyboard())
-
         elif "suhu+ntu" in tipe or "semua" in tipe:
             buf = create_dual_plot(data, start_date, end_date)
             await update.message.reply_photo(photo=buf, caption="📊 Grafik Suhu & NTU", reply_markup=main_menu_keyboard())
-
         else:
             await update.message.reply_text("❌ Pilih Suhu / NTU / Suhu+NTU", reply_markup=main_menu_keyboard())
             return TIPE_GRAFIK
 
     return ConversationHandler.END
 
-# ====== Riwayat Pakan ======
+# Riwayat pakan
 async def riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Pakai:
-      /riwayat              → tampilkan semua data hari ini
-      /riwayat YYYY-MM-DD   → tampilkan data tanggal tertentu
-      /riwayat YYYY-MM-DD_HH-MM → tampilkan dokumen spesifik
+    /riwayat
+    /riwayat YYYY-MM-DD
+    /riwayat YYYY-MM-DD_HH-MM
     """
     args = context.args if hasattr(context, "args") else []
     id_exact = None
@@ -792,7 +759,6 @@ async def riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args:
         param = args[0].strip()
         if "_" in param:
-            # contoh: 2025-08-23_02-35
             id_exact = param
             title = f"📜 *Riwayat Pakan (Dokumen {param})*"
         else:
@@ -810,7 +776,6 @@ async def riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
     else:
-        # default: pakai hari ini
         date_filter = datetime.now().strftime("%Y-%m-%d")
 
     rows = fetch_feed_history_firestore(
@@ -838,12 +803,8 @@ async def riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
-
-    # ====== Notifikasi NTU ======
+# NTU alert direct (jaga-jaga listener per field)
 async def check_ntu_alert_direct(bot, ntu, timestamp=None):
-    """
-    Kirim notif NTU hanya sekali per hari jika NTU di range 1501–3000.
-    """
     try:
         if ntu is None:
             return
@@ -851,26 +812,20 @@ async def check_ntu_alert_direct(bot, ntu, timestamp=None):
         if timestamp:
             try:
                 dt = datetime.strptime(timestamp, "%Y-%m-%d_%H-%M")
-            except:
+            except Exception:
                 dt = datetime.now()
         else:
             dt = datetime.now()
 
-        today_str = dt.strftime("%Y-%m-%d")  # tanggal saat ini
+        today_str = dt.strftime("%Y-%m-%d")
         timestamp_str = dt.strftime("%d %B %Y %H:%M")
 
-        # Simpan state: last_notified_ntu dan tanggal terakhir
         if not hasattr(check_ntu_alert_direct, "last_notified_date"):
             check_ntu_alert_direct.last_notified_date = None
-        if not hasattr(check_ntu_alert_direct, "last_notified_value"):
-            check_ntu_alert_direct.last_notified_value = None
 
-        # Cek range NTU
         if 1501 <= ntu <= 3000:
-            # jika hari ini belum dikirim notif NTU
             if check_ntu_alert_direct.last_notified_date != today_str:
                 check_ntu_alert_direct.last_notified_date = today_str
-                check_ntu_alert_direct.last_notified_value = ntu
                 try:
                     await bot.send_message(
                         chat_id=CHAT_ID,
@@ -878,48 +833,41 @@ async def check_ntu_alert_direct(bot, ntu, timestamp=None):
                         parse_mode="Markdown"
                     )
                 except Exception as e:
-                    print(f"Gagal mengirim notif Telegram: {e}")
+                    logger.error(f"Gagal mengirim notif Telegram: {e}")
         else:
-            # reset state jika NTU di luar range
             check_ntu_alert_direct.last_notified_date = None
-            check_ntu_alert_direct.last_notified_value = None
-
     except Exception as e:
-        print(f"Error di check_ntu_alert_direct: {e}")
+        logger.error(f"Error di check_ntu_alert_direct: {e}")
 
-# ====== Main ======
-# ====== Conversation states ======
-SETJAM, PERIODE, TANGGAL, TIPE_GRAFIK, SETJAM_HARIAN = range(5)
-
+# =========================
+# Main App
+# =========================
 def main():
-    TOKEN = "7708297911:AAFPNtjzKIGfmMzY1Zk5sLu97r0ChpJFRkk"
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Load jadwal pakan dari Realtime DB
+    # Load jadwal
     load_feed_schedules()
 
-    # Command handlers
-    app.add_handler(CommandHandler("start", start))
+    # Commands
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("pakan", pakan))
     app.add_handler(CommandHandler("jadwal", jadwal))
     app.add_handler(CommandHandler("hapusjam", hapusjam))
     app.add_handler(CommandHandler("monitoring", monitoring))
     app.add_handler(CommandHandler("riwayat", riwayat))
 
-    # Notifikasi pakan otomatis tiap 60 detik
+    # Jobs
     app.job_queue.run_repeating(check_auto_feed, interval=60, first=5)
 
-    # ====== ConversationHandler: Setjam Interaktif ======
+    # Conversation: setjam
     setjam_handler = ConversationHandler(
         entry_points=[CommandHandler("setjam", setjam_start)],
-        states={
-            SETJAM: [MessageHandler(filters.TEXT & ~filters.COMMAND, setjam_input)]
-        },
+        states={ SETJAM: [MessageHandler(filters.TEXT & ~filters.COMMAND, setjam_input)] },
         fallbacks=[CommandHandler("batal", setjam_cancel)]
     )
     app.add_handler(setjam_handler)
 
-    # ====== ConversationHandler: Grafik Interaktif ======
+    # Conversation: grafik
     grafik_handler = ConversationHandler(
         entry_points=[CommandHandler('grafik', grafik_start)],
         states={
@@ -930,49 +878,14 @@ def main():
         fallbacks=[CommandHandler('batal', grafik_cancel)]
     )
     app.add_handler(grafik_handler)
+    # Tambah state SETJAM_HARIAN
+    grafik_handler.states[SETJAM_HARIAN] = [MessageHandler(filters.TEXT & ~filters.COMMAND, grafik_setjam_harian)]
 
-    # Tambahkan state untuk input jam harian
-    grafik_harian_jam_handler = MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        grafik_setjam_harian
-    )
-    grafik_handler.states[SETJAM_HARIAN] = [grafik_harian_jam_handler]
+    # Listener sensors (jalan di thread terpisah)
+    threading.Thread(target=start_temperature_listener, args=(app.bot, loop), daemon=True).start()
 
-    # ====== Listener Suhu & NTU ======
-    def start_sensor_listener(bot, loop):
-        ref_temp = db.reference('/aquarium/sensors/temperature')
-        ref_ntu  = db.reference('/aquarium/sensors/ntu')
-
-        def temp_listener(event):
-            data = event.data
-            if not data:
-                return
-            temp = data.get("value") if isinstance(data, dict) else data
-            timestamp = data.get("time") if isinstance(data, dict) else None
-            asyncio.run_coroutine_threadsafe(
-                check_temperature_ntu_alert(bot, temp, ntu=None, timestamp=timestamp),
-                loop
-            )
-
-        def ntu_listener(event):
-            data = event.data
-            if not data:
-                return
-            ntu = data.get("value") if isinstance(data, dict) else data
-            timestamp = data.get("time") if isinstance(data, dict) else None
-            asyncio.run_coroutine_threadsafe(
-                check_ntu_alert_direct(bot, ntu, timestamp),
-                loop
-            )
-
-        ref_temp.listen(temp_listener)
-        ref_ntu.listen(ntu_listener)
-
-    # Jalankan listener suhu & NTU di thread terpisah
-    threading.Thread(target=start_sensor_listener, args=(app.bot, loop), daemon=True).start()
-
-    print("Bot siap... Tekan Ctrl+C untuk berhenti.")
-    app.run_polling()
+    logger.info("Bot siap berjalan (long polling).")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
