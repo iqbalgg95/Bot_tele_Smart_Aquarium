@@ -66,19 +66,10 @@ def _load_credentials():
         raise RuntimeError("FIREBASE_CREDENTIALS_JSON tidak ditemukan")
 
     try:
-        # Parse JSON
         cred_dict = json.loads(blob)
 
-        # 🔑 Perbaikan untuk private_key
         if "private_key" in cred_dict:
-            key = cred_dict["private_key"]
-
-            # Kalau masih ada '\n' literal, ubah jadi newline asli
-            if "\\n" in key:
-                cred_dict["private_key"] = key.replace("\\n", "\n")
-
-            # Kalau ada spasi/escape aneh di awal/akhir → strip
-            cred_dict["private_key"] = cred_dict["private_key"].strip()
+            cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n").strip()
 
         sa_credentials = service_account.Credentials.from_service_account_info(cred_dict)
         return cred_dict, sa_credentials
@@ -946,5 +937,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
