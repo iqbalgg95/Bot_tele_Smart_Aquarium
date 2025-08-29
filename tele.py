@@ -1,5 +1,5 @@
 # tele_bot_interaktif_final_fix_menu.py
-import os, io, time, asyncio, threading, logging
+import os, io, time, asyncio, threading, logging, json
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -20,6 +20,7 @@ from firebase_admin import credentials, db
 from google.cloud import firestore
 from google.cloud.firestore_v1 import FieldFilter
 from google.auth.exceptions import TransportError
+from google.oauth2 import service_account  # <-- for Firestore client creds
 
 # =========================
 # Logging
@@ -36,8 +37,8 @@ logger = logging.getLogger("fish-bot")
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # wajib
 CHAT_ID = int(os.getenv("BOT_CHAT_ID", "0"))  # wajib → ganti di env
 RTDB_URL = os.getenv("RTDB_URL")  # wajib: ex https://xxxxx-default-rtdb.asia-southeast1.firebasedatabase.app/
-GA_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-GA_JSON = os.getenv("FIREBASE_CREDENTIALS_JSON", "").strip()
+GA_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()  # opsional (fallback)
+GA_JSON_RAW = os.getenv("FIREBASE_CREDENTIALS_JSON", "").strip()   # prefer
 
 if not BOT_TOKEN:
     raise RuntimeError("Env BOT_TOKEN belum diset.")
@@ -46,26 +47,76 @@ if CHAT_ID == 0:
 if not RTDB_URL:
     raise RuntimeError("Env RTDB_URL belum diset.")
 
-# Jika kredensial diberikan sebagai JSON string, simpan ke file temp
-if not GA_PATH and GA_JSON:
-    GA_PATH = "/tmp/firebase_service_account.json"
-    with open(GA_PATH, "w", encoding="utf-8") as f:
-        f.write(GA_JSON)
+def _extract_json_blob(s: str) -> str:
+    """
+    Ambil substring JSON dari string yang mungkin mengandung prefix/suffix seperti
+    '${{shared.FIREBASE_CREDENTIALS_JSON}}{ ... }' dari Railway.
+    """
+    if not s:
+        return s
+    start = s.find("{")
+    end = s.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return s
+    return s[start:end+1]
 
-if not GA_PATH or not os.path.exists(GA_PATH):
-    raise RuntimeError("Credential Firebase tidak ditemukan. Set GOOGLE_APPLICATION_CREDENTIALS atau FIREBASE_CREDENTIALS_JSON.")
+def _load_credentials():
+    """
+    Prioritas:
+      1) FIREBASE_CREDENTIALS_JSON (string JSON)
+      2) GOOGLE_APPLICATION_CREDENTIALS (path file)
+    Return: (cred_dict, sa_credentials)
+      - cred_dict untuk firebase_admin.credentials.Certificate
+      - sa_credentials untuk Firestore (google.oauth2.service_account.Credentials)
+    """
+    # 1) Dari ENV JSON string
+    if GA_JSON_RAW:
+        blob = _extract_json_blob(GA_JSON_RAW)
+        try:
+            cred_dict = json.loads(blob)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"FIREBASE_CREDENTIALS_JSON tidak valid: {e}")
+
+        # Normalisasi private_key bila ada \r\n
+        pk = cred_dict.get("private_key")
+        if isinstance(pk, str):
+            # Jika ada literal '\\n', biarkan; jika ada CRLF, normalkan
+            cred_dict["private_key"] = pk.replace("\r\n", "\n")
+
+        # Buat service account credentials untuk Firestore
+        sa_credentials = service_account.Credentials.from_service_account_info(cred_dict)
+        return cred_dict, sa_credentials
+
+    # 2) Fallback: dari file path
+    if GA_PATH and os.path.exists(GA_PATH):
+        # Baca dict untuk firebase_admin
+        try:
+            with open(GA_PATH, "r", encoding="utf-8") as f:
+                cred_dict = json.load(f)
+        except Exception as e:
+            raise RuntimeError(f"Gagal membaca file kredensial {GA_PATH}: {e}")
+
+        pk = cred_dict.get("private_key")
+        if isinstance(pk, str):
+            cred_dict["private_key"] = pk.replace("\r\n", "\n")
+
+        # Firestore credential dari file
+        sa_credentials = service_account.Credentials.from_service_account_file(GA_PATH)
+        return cred_dict, sa_credentials
+
+    raise RuntimeError("Credential Firebase tidak ditemukan. Set FIREBASE_CREDENTIALS_JSON atau GOOGLE_APPLICATION_CREDENTIALS.")
 
 # =========================
-# Inisialisasi Firebase
+# Inisialisasi Firebase & Firestore
 # =========================
+cred_dict, sa_credentials = _load_credentials()
+
 if not firebase_admin._apps:
-    cred = credentials.Certificate(GA_PATH)
-    firebase_admin.initialize_app(cred, {
-        'databaseURL': RTDB_URL
-    })
+    app_cred = credentials.Certificate(cred_dict)  # langsung dari dict
+    firebase_admin.initialize_app(app_cred, {'databaseURL': RTDB_URL})
 
-# Firestore client
-fs_client = firestore.Client.from_service_account_json(GA_PATH)
+# Firestore client pakai credentials dari dict
+fs_client = firestore.Client(project=cred_dict.get("project_id"), credentials=sa_credentials)
 
 # =========================
 # Event loop (untuk thread listener)
