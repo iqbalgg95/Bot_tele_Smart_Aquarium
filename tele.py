@@ -61,29 +61,21 @@ def _extract_json_blob(s: str) -> str:
     return s[start:end+1]
 
 def _load_credentials():
-    """
-    Prioritas:
-      1) FIREBASE_CREDENTIALS_JSON (string JSON / base64)
-      2) GOOGLE_APPLICATION_CREDENTIALS (path file)
-    Return: (cred_dict, sa_credentials)
-      - cred_dict untuk firebase_admin.credentials.Certificate
-      - sa_credentials untuk Firestore (google.oauth2.service_account.Credentials)
-    """
-    # 1) Dari ENV JSON string / base64
-    if GA_JSON_RAW:
-        blob = _extract_json_blob(GA_JSON_RAW)
-        cred_dict = None
+    blob = os.getenv("FIREBASE_CREDENTIALS_JSON")
+    if not blob:
+        raise RuntimeError("FIREBASE_CREDENTIALS_JSON tidak ditemukan")
 
-        # Coba parse langsung sebagai JSON
-        try:
-            cred_dict = json.loads(blob)
-        except json.JSONDecodeError:
-            # Coba decode base64 -> JSON
-            try:
-                decoded = base64.b64decode(blob).decode("utf-8")
-                cred_dict = json.loads(decoded)
-            except Exception as e:
-                raise RuntimeError(f"FIREBASE_CREDENTIALS_JSON tidak valid: {e}")
+    try:
+        cred_dict = json.loads(blob)
+
+        # FIX: ubah \n menjadi newline beneran di private_key
+        if "private_key" in cred_dict:
+            cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
+
+        sa_credentials = service_account.Credentials.from_service_account_info(cred_dict)
+        return cred_dict, sa_credentials
+    except Exception as e:
+        raise RuntimeError(f"FIREBASE_CREDENTIALS_JSON tidak valid: {e}")
 
         # Normalisasi private_key
         pk = cred_dict.get("private_key")
@@ -955,3 +947,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
